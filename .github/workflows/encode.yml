@@ -1,0 +1,90 @@
+name: Encode
+
+run-name: Encode ${{ inputs.slug }}
+
+# Started by the troszakdamian.com admin after a raw upload to R2.
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Video slug, the raw upload lives under raw/<slug>/ in R2
+        required: true
+        type: string
+
+concurrency:
+  group: encode-${{ inputs.slug }}
+
+permissions:
+  contents: read
+
+jobs:
+  encode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      SLUG: ${{ inputs.slug }}
+      BUCKET: dt-landing
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+      AWS_DEFAULT_REGION: auto
+      # R2 rejects the checksums newer AWS CLIs send by default.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - name: Check slug
+        id: slug
+        run: '[[ "$SLUG" =~ ^[a-z0-9-]+$ ]]'
+
+      - uses: actions/checkout@v7
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+
+      - name: Download upload
+        run: |
+          read -r key size < <(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "raw/$SLUG/" \
+            --query 'Contents[?!ends_with(Key, `failed`)] | [0].[Key, Size]' --output text)
+          if [[ -z "$key" || "$key" == None ]]; then
+            echo "No raw upload under raw/$SLUG/" >&2
+            exit 1
+          fi
+
+          # The key is the only thing keeping the raw file private.
+          echo "::add-mask::$key"
+          echo "RAW_KEY=$key" >> "$GITHUB_ENV"
+
+          # Big sources need the space taken by preinstalled toolchains.
+          if (( size > 8 * 1024 ** 3 )); then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          fi
+
+          aws s3 cp "s3://$BUCKET/$key" source --only-show-errors
+
+      - name: Encode
+        run: ./encode-hls.sh source "$SLUG"
+
+      - name: Upload HLS bundle
+        run: |
+          if ! aws s3api head-object --bucket "$BUCKET" --key "$RAW_KEY" > /dev/null 2>&1; then
+            echo "The upload was deleted while encoding, skipping."
+            exit 0
+          fi
+
+          out="out/$SLUG"
+          dest="s3://$BUCKET/hls/$SLUG"
+          aws s3 cp "$out" "$dest" --recursive --exclude '*' --include '*.ts' \
+            --content-type video/mp2t --only-show-errors
+          aws s3 cp "$out" "$dest" --recursive --exclude '*' --include '*.m3u8' \
+            --content-type application/vnd.apple.mpegurl --only-show-errors
+          aws s3 cp "$out/thumbnail.jpg" "$dest/thumbnail.jpg" \
+            --content-type image/jpeg --only-show-errors
+
+          # The admin shows the video as ready once the raw upload is gone.
+          aws s3 rm "s3://$BUCKET/$RAW_KEY" --only-show-errors
+
+      - name: Mark failed
+        if: (failure() || cancelled()) && steps.slug.outcome == 'success'
+        run: |
+          echo "Encode failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" |
+            aws s3 cp - "s3://$BUCKET/raw/$SLUG/failed" --only-show-errors
